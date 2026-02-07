@@ -1,4 +1,4 @@
-name: Online phpMyAdmin via Tailscale
+name: Online phpMyAdmin & RDP via Tailscale
 
 on:
   workflow_dispatch:
@@ -9,91 +9,104 @@ jobs:
     timeout-minutes: 3600
 
     steps:
-      # 1️⃣ Install IIS Components
+      # 1️⃣ Install IIS (Web Server)
       - name: Install IIS
         run: |
-          Add-WindowsFeature Web-Server, Web-WebServer, Web-Common-Http, Web-Default-Doc, Web-Static-Content, Web-ASP, Web-CGI
+          Add-WindowsFeature Web-Server, Web-WebServer, Web-Common-Http, Web-Default-Doc, Web-Static-Content, Web-ASP
           Write-Host "✅ IIS installed"
 
-      # 2️⃣ Configure PHP & IIS Handler
-      - name: Configure PHP
+      # 2️⃣ Install PHP
+      - name: Install PHP
         run: |
-          # PHP install if not exists
-          choco install php -y --no-progress
-          
-          $phpCgiPath = "C:\tools\php\php-cgi.exe"
-          Import-Module WebAdministration -SkipEditionCheck
-          
-          # Default Document (index.php) fix - Correct Syntax
-          Set-WebConfigurationProperty -pspath 'MACHINE/WEBROOT/APPHOST' -filter "system.webServer/defaultDocument/files" -name "collection" -value @{value='index.php'} -ErrorAction SilentlyContinue
-          
-          # Handler configuration
-          Remove-WebHandler -Name "PHP_via_FastCGI" -ErrorAction SilentlyContinue
-          New-WebHandler -Name "PHP_via_FastCGI" -Path "*.php" -Verb "*" -Modules "FastCgiModule" -ScriptProcessor $phpCgiPath -Force
-          Write-Host "✅ PHP Handler and Default Doc Configured"
+          choco install php -y
+          Write-Host "✅ PHP installed"
 
       # 3️⃣ Install MySQL
       - name: Install MySQL
         run: |
-          choco install mysql -y --no-progress
-          Start-Sleep -Seconds 10
+          choco install mysql -y
+          # Generate 16-char alphanumeric root password
           $rootPass = -join ((1..16) | ForEach-Object { ([char[]](48..57 + 65..90 + 97..122) | Get-Random) })
-          # MySQL Path check
-          $mysqlExe = "C:\tools\mysql\current\bin\mysql.exe"
-          & $mysqlExe -u root -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '$rootPass'; FLUSH PRIVILEGES;"
+          & "C:\Program Files\MySQL\MySQL Server 8.0\bin\mysql.exe" -u root -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '$rootPass'; FLUSH PRIVILEGES;"
           echo "MYSQL_ROOT=$rootPass" >> $env:GITHUB_ENV
-          Write-Host "✅ MySQL Ready"
+          Write-Host "✅ MySQL installed, root password set"
 
-      # 4️⃣ Install phpMyAdmin
+      # 4️⃣ Download & Configure phpMyAdmin
       - name: Install phpMyAdmin
         run: |
           $pmaDir = "C:\inetpub\wwwroot\phpMyAdmin"
-          if (Test-Path $pmaDir) { Remove-Item $pmaDir -Recurse -Force }
-          New-Item -Path $pmaDir -ItemType Directory -Force
-          
           Invoke-WebRequest -Uri "https://www.phpmyadmin.net/downloads/phpMyAdmin-latest-all-languages.zip" -OutFile "$env:TEMP\pma.zip"
-          Expand-Archive "$env:TEMP\pma.zip" -DestinationPath "$env:TEMP\pma_extracted" -Force
-          
-          $internalFolder = Get-ChildItem "$env:TEMP\pma_extracted" | Where-Object { $_.PSIsContainer } | Select-Object -First 1
-          Copy-Item -Path "$($internalFolder.FullName)\*" -Destination $pmaDir -Recurse -Force
-          
-          # Permissions
+          Expand-Archive "$env:TEMP\pma.zip" -DestinationPath $pmaDir -Force
+          Remove-Item "$env:TEMP\pma.zip"
+          Import-Module WebAdministration
           $acl = Get-Acl $pmaDir
           $rule = New-Object System.Security.AccessControl.FileSystemAccessRule("IIS_IUSRS","FullControl","ContainerInherit,ObjectInherit","None","Allow")
           $acl.SetAccessRule($rule)
           Set-Acl $pmaDir $acl
-          Write-Host "✅ phpMyAdmin Files and Permissions Fixed"
+          Add-WebConfigurationProperty -pspath 'IIS:\' -filter "system.webServer/defaultDocument/files" -name "." -value @{value="index.php"}
+          Set-WebConfigurationProperty -Filter "system.webServer/directoryBrowse" -PSPath "IIS:\Sites\Default Web Site" -Name "enabled" -Value "true"
+          Write-Host "✅ phpMyAdmin installed"
 
       # 5️⃣ Install & Connect Tailscale
-      - name: Install & Connect Tailscale
+      - name: Install Tailscale
+        run: |
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $installer = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $url -OutFile $installer
+          Start-Process msiexec.exe -ArgumentList "/i `"$installer`" /quiet /norestart" -Wait
+          Remove-Item $installer -Force
+
+      - name: Connect Tailscale
         env:
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
-          Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\tailscale.msi"
-          Start-Process msiexec.exe -ArgumentList "/i `"$env:TEMP\tailscale.msi`" /quiet /norestart" -Wait
-          
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=gh-sql-server
-          
+          if (-not $env:TAILSCALE_AUTH_KEY) { Write-Error "TAILSCALE_AUTH_KEY missing"; exit 1 }
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=gh-runner-$env:GITHUB_RUN_ID
           $tsIP = $null
-          while (-not $tsIP) {
+          for ($i=0; $i -lt 20; $i++) {
               $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 2
+              if ($tsIP) { break }
+              Start-Sleep -Seconds 5
           }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
-      # 6️⃣ Screen Monitoring (Credentials loop)
-      - name: Show Credentials Loop
+      # 6️⃣ Setup RDP User & Enable Remote Desktop
+      - name: Setup RDP Access
+        run: |
+          $rdpPass = -join ((1..16) | ForEach-Object { ([char[]](48..57 + 65..90 + 97..122) | Get-Random) })
+          $rdpUser = "RDPAdmin"
+          $secPassword = ConvertTo-SecureString $rdpPass -AsPlainText -Force
+          New-LocalUser -Name $rdpUser -Password $secPassword -FullName "RDP Administrator" -Description "Remote Access"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $rdpUser
+          Add-LocalGroupMember -Group "Administrators" -Member $rdpUser
+          
+          # Registry settings to allow RDP
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1
+          
+          echo "RDP_USER=$rdpUser" >> $env:GITHUB_ENV
+          echo "RDP_PASS=$rdpPass" >> $env:GITHUB_ENV
+          Write-Host "✅ RDP user created and service enabled"
+
+      # 7️⃣ Display All Access Details
+      - name: Show Access Info
+        run: |
+          Write-Host "`n=========================================="
+          Write-Host "🚀 SERVER ACCESS DETAILS"
+          Write-Host "=========================================="
+          Write-Host "📍 Tailscale IP: $env:TAILSCALE_IP"
+          Write-Host "🌐 phpMyAdmin: http://$env:TAILSCALE_IP/phpMyAdmin"
+          Write-Host "🗄️ MySQL Root Pass: $env:MYSQL_ROOT"
+          Write-Host "------------------------------------------"
+          Write-Host "🖥️ RDP Username: $env:RDP_USER"
+          Write-Host "🔑 RDP Password: $env:RDP_PASS"
+          Write-Host "=========================================="
+
+      # 8️⃣ Keep Runner Alive
+      - name: Keep session alive
         run: |
           while ($true) {
-              Write-Host "`n"
-              Write-Host "***********************************************" -ForegroundColor Green
-              Write-Host "  PHP MY ADMIN ACCESS DETAILS" -ForegroundColor White
-              Write-Host "***********************************************"
-              Write-Host "  URL:      http://$env:TAILSCALE_IP/phpMyAdmin/" -ForegroundColor Yellow
-              Write-Host "  USER:     root" -ForegroundColor White
-              Write-Host "  PASSWORD: $env:MYSQL_ROOT" -ForegroundColor Red
-              Write-Host "***********************************************"
-              Write-Host "  Keep-Alive: $(Get-Date)"
+              Write-Host "[$(Get-Date)] Runner is running... (Tailscale: $env:TAILSCALE_IP)"
               Start-Sleep -Seconds 300
           }
