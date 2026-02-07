@@ -9,7 +9,37 @@ jobs:
     timeout-minutes: 3600
 
     steps:
-      # 1️⃣ Install Tailscale
+      # 1️⃣ Install IIS (Web Server)
+      - name: Install IIS
+        run: |
+          Add-WindowsFeature Web-Server, Web-WebServer, Web-Common-Http, Web-Default-Doc, Web-Static-Content, Web-ASP
+          Write-Host "✅ IIS installed"
+
+      # 2️⃣ Install PHP
+      - name: Install PHP
+        run: |
+          choco install php -y
+          Write-Host "✅ PHP installed"
+      
+      # 3️⃣ Install MySQL
+      - name: Install MySQL
+        run: |
+          choco install mysql -y
+          $rootPass = -join ((1..16) | ForEach-Object { ([char[]](33..126)) | Get-Random })
+          & "C:\Program Files\MySQL\MySQL Server 8.0\bin\mysqladmin.exe" -u root password $rootPass
+          echo "MYSQL_ROOT=$rootPass" >> $env:GITHUB_ENV
+          Write-Host "✅ MySQL installed, root password set"
+
+      # 4️⃣ Download & Configure phpMyAdmin
+      - name: Install phpMyAdmin
+        run: |
+          $pmaDir = "C:\inetpub\wwwroot\phpMyAdmin"
+          Invoke-WebRequest -Uri "https://www.phpmyadmin.net/downloads/phpMyAdmin-latest-all-languages.zip" -OutFile "$env:TEMP\pma.zip"
+          Expand-Archive "$env:TEMP\pma.zip" -DestinationPath $pmaDir -Force
+          Remove-Item "$env:TEMP\pma.zip"
+          Write-Host "✅ phpMyAdmin installed at $pmaDir"
+
+      # 5️⃣ Install & Connect Tailscale
       - name: Install Tailscale
         run: |
           $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
@@ -17,79 +47,38 @@ jobs:
           Invoke-WebRequest -Uri $url -OutFile $installer
           Start-Process msiexec.exe -ArgumentList "/i `"$installer`" /quiet /norestart" -Wait
           Remove-Item $installer -Force
+          Write-Host "✅ Tailscale installed"
 
-      # 2️⃣ Connect Tailscale (6-month auth key)
-      - name: Start Tailscale
+      - name: Connect Tailscale
         env:
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          if (-not $env:TAILSCALE_AUTH_KEY) {
-              Write-Error "TAILSCALE_AUTH_KEY missing"
-              exit 1
-          }
-
+          if (-not $env:TAILSCALE_AUTH_KEY) { Write-Error "TAILSCALE_AUTH_KEY missing"; exit 1 }
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=gh-runner-$env:GITHUB_RUN_ID
-
-          # Wait for IP assignment
+          # Wait for Tailscale IP
           $tsIP = $null
           for ($i=0; $i -lt 20; $i++) {
               $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
               if ($tsIP) { break }
               Write-Host "Waiting for Tailscale IP... ($($i+1)/20)"
-              Start-Sleep -Seconds 10
+              Start-Sleep -Seconds 5
           }
-
-          if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned"
-              & "$env:ProgramFiles\Tailscale\tailscale.exe" status
-              exit 1
-          }
-
-          Write-Host "Tailscale IP: $tsIP"
+          if (-not $tsIP) { Write-Error "Tailscale IP not assigned"; exit 1 }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Write-Host "✅ Tailscale IP assigned: $tsIP"
 
-      # 3️⃣ Install IIS + PHP
-      - name: Install IIS + PHP
-        run: |
-          # IIS features
-          Add-WindowsFeature Web-Server, Web-WebServer, Web-Common-Http, Web-Default-Doc, Web-Static-Content, Web-ASP-Net45, Web-ISAPI-Ext, Web-ISAPI-Filter
-          # Install PHP via Chocolatey
-          choco install php --version=8.2 -y
-          Start-Service W3SVC
-
-      # 4️⃣ Install MySQL + phpMyAdmin
-      - name: Install MySQL + phpMyAdmin
-        run: |
-          # Install MySQL
-          choco install mysql -y
-          $rootPass = -join ((1..16) | ForEach-Object { ([char[]](33..126)) | Get-Random })
-          & "C:\Program Files\MySQL\MySQL Server 8.0\bin\mysqladmin.exe" -u root password $rootPass
-          echo "MYSQL_ROOT=$rootPass" >> $env:GITHUB_ENV
-
-          # phpMyAdmin
-          $pmaDir = "C:\inetpub\wwwroot\phpMyAdmin"
-          New-Item -Path $pmaDir -ItemType Directory -Force
-          Invoke-WebRequest -Uri "https://www.phpmyadmin.net/downloads/phpMyAdmin-latest-all-languages.zip" -OutFile "$env:TEMP\pma.zip"
-          Expand-Archive "$env:TEMP\pma.zip" -DestinationPath $pmaDir
-          Remove-Item "$env:TEMP\pma.zip"
-          Write-Host "phpMyAdmin installed at $pmaDir"
-
-      # 5️⃣ Open firewall for HTTP
-      - name: Open HTTP port
-        run: |
-          netsh advfirewall firewall add rule name="HTTP-Tailscale" dir=in action=allow protocol=TCP localport=80
-
-      # 6️⃣ Display Access Info
+      # 6️⃣ Display phpMyAdmin URL
       - name: Show Access Info
         run: |
           Write-Host "`n==============================="
-          Write-Host "✅ Tailscale IP: $env:TAILSCALE_IP"
-          Write-Host "✅ MySQL Root: $env:MYSQL_ROOT"
-          Write-Host "✅ phpMyAdmin URL: http://$env:TAILSCALE_IP/phpMyAdmin"
+          Write-Host "✅ phpMyAdmin ACCESS DETAILS"
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          Write-Host "phpMyAdmin URL: http://$env:TAILSCALE_IP/phpMyAdmin"
+          Write-Host "MySQL Root Password: $env:MYSQL_ROOT"
           Write-Host "==============================="
 
-      # 7️⃣ Keep server alive
-      - name: Keep Alive
+      # 7️⃣ Keep Runner Alive
+      - name: Keep session alive
         run: |
           while ($true) {
               Write-Host "[$(Get-Date)] Server active..."
