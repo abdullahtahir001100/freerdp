@@ -12,7 +12,7 @@ jobs:
       # 1️⃣ Install IIS (Web Server)
       - name: Install IIS
         run: |
-          Add-WindowsFeature Web-Server, Web-WebServer, Web-Common-Http, Web-Default-Doc, Web-Static-Content, Web-ASP
+          Add-WindowsFeature Web-Server, Web-WebServer, Web-Common-Http, Web-Default-Doc, Web-Static-Content, Web-ASP, Web-CGI
           Write-Host "✅ IIS installed"
 
       # 2️⃣ Install PHP
@@ -20,15 +20,22 @@ jobs:
         run: |
           choco install php -y
           Write-Host "✅ PHP installed"
-      
+
+          # Configure IIS FastCGI Handler for PHP
+          $phpPath = "C:\tools\php\php.exe"
+          Import-Module WebAdministration
+          Remove-WebHandler -Name "PHP_via_FastCGI" -ErrorAction SilentlyContinue
+          New-WebHandler -Name "PHP_via_FastCGI" -Path "*.php" -Verb "*" -Modules "FastCgiModule" -ScriptProcessor $phpPath -Force
+          Write-Host "✅ PHP Handler configured in IIS"
+
       # 3️⃣ Install MySQL
       - name: Install MySQL
         run: |
           choco install mysql -y
-          # Generate 16-char alphanumeric root password (safe for CLI)
+          # Generate 16-char alphanumeric root password
           $rootPass = -join ((1..16) | ForEach-Object { ([char[]](48..57 + 65..90 + 97..122) | Get-Random) })
           # Initialize MySQL root password safely
-          & "C:\Program Files\MySQL\MySQL Server 8.0\bin\mysql.exe" -u root -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '$rootPass'; FLUSH PRIVILEGES;"
+          & "C:\tools\mysql\current\bin\mysql.exe" -u root -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '$rootPass'; FLUSH PRIVILEGES;"
           echo "MYSQL_ROOT=$rootPass" >> $env:GITHUB_ENV
           Write-Host "✅ MySQL installed, root password set"
 
@@ -39,7 +46,14 @@ jobs:
           Invoke-WebRequest -Uri "https://www.phpmyadmin.net/downloads/phpMyAdmin-latest-all-languages.zip" -OutFile "$env:TEMP\pma.zip"
           Expand-Archive "$env:TEMP\pma.zip" -DestinationPath $pmaDir -Force
           Remove-Item "$env:TEMP\pma.zip"
-          Write-Host "✅ phpMyAdmin installed at $pmaDir"
+
+          # Fix IIS permissions
+          $acl = Get-Acl $pmaDir
+          $rule = New-Object System.Security.AccessControl.FileSystemAccessRule("IIS_IUSRS","FullControl","ContainerInherit,ObjectInherit","None","Allow")
+          $acl.SetAccessRule($rule)
+          Set-Acl $pmaDir $acl
+
+          Write-Host "✅ phpMyAdmin installed at $pmaDir with correct IIS permissions"
 
       # 5️⃣ Install & Connect Tailscale
       - name: Install Tailscale
@@ -57,6 +71,7 @@ jobs:
         run: |
           if (-not $env:TAILSCALE_AUTH_KEY) { Write-Error "TAILSCALE_AUTH_KEY missing"; exit 1 }
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=gh-runner-$env:GITHUB_RUN_ID
+
           # Wait for Tailscale IP
           $tsIP = $null
           for ($i=0; $i -lt 20; $i++) {
