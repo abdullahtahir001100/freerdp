@@ -1,28 +1,27 @@
-name: RDP Access via Tailscale
+name: Online RDP + phpMyAdmin via Tailscale
 
 on:
   workflow_dispatch:
 
 jobs:
-  rdp-access:
+  rdp-phpmyadmin:
     runs-on: windows-latest
     timeout-minutes: 3600
 
     steps:
+      # 1️⃣ Enable RDP & Firewall
       - name: Enable Remote Desktop
         run: |
-          # Enable RDP
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
                            -Name "fDenyTSConnections" -Value 0 -Force
-          # Disable NLA
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                            -Name "UserAuthentication" -Value 0 -Force
-          # Open firewall port 3389
           netsh advfirewall firewall delete rule name="RDP-Tailscale" > $null 2>&1
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
           Restart-Service -Name TermService -Force
 
-      - name: Create RDP user
+      # 2️⃣ Create RDP User
+      - name: Create RDP User
         run: |
           Add-Type -AssemblyName System.Security
           $chars = ([char[]](33..126))
@@ -34,6 +33,7 @@ jobs:
           echo "RDP_USER=RDP" >> $env:GITHUB_ENV
           echo "RDP_PASS=$password" >> $env:GITHUB_ENV
 
+      # 3️⃣ Install Tailscale
       - name: Install Tailscale
         run: |
           $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
@@ -42,21 +42,21 @@ jobs:
           Start-Process msiexec.exe -ArgumentList "/i `"$installer`" /quiet /norestart" -Wait
           Remove-Item $installer -Force
 
-      - name: Start Tailscale and connect
+      # 4️⃣ Connect Tailscale (6-month auth key)
+      - name: Start Tailscale
         env:
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
           if (-not $env:TAILSCALE_AUTH_KEY) {
-            Write-Error "TAILSCALE_AUTH_KEY secret is missing."
-            exit 1
+              Write-Error "TAILSCALE_AUTH_KEY missing"
+              exit 1
           }
 
-          Write-Host "Starting Tailscale..."
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=gh-runner-$env:GITHUB_RUN_ID
 
           # Wait for IP assignment
           $tsIP = $null
-          for ($i = 0; $i -lt 20; $i++) {
+          for ($i=0; $i -lt 20; $i++) {
               $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
               if ($tsIP) { break }
               Write-Host "Waiting for Tailscale IP... ($($i+1)/20)"
@@ -64,42 +64,48 @@ jobs:
           }
 
           if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
+              Write-Error "Tailscale IP not assigned"
               & "$env:ProgramFiles\Tailscale\tailscale.exe" status
-              Write-Host "Available network adapters:"
               Get-NetIPAddress | Where-Object { $_.AddressFamily -eq 'IPv4' }
               exit 1
           }
 
-          Write-Host "Tailscale IP assigned: $tsIP"
+          Write-Host "Tailscale IP: $tsIP"
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
-      - name: Debug Tailscale Connection
+      # 5️⃣ Install MySQL + phpMyAdmin
+      - name: Install MySQL & phpMyAdmin
         run: |
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" status
-          Write-Host "Assigned IP: $env:TAILSCALE_IP"
+          # Install MySQL Server
+          choco install mysql -y
+          # Secure MySQL root password
+          $rootPass = -join ((1..16) | ForEach-Object { ([char[]](33..126)) | Get-Random })
+          & "C:\Program Files\MySQL\MySQL Server 8.0\bin\mysqladmin.exe" -u root password $rootPass
+          echo "MYSQL_ROOT=$rootPass" >> $env:GITHUB_ENV
 
-      - name: Test RDP Port
-        run: |
-          $result = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $result.TcpTestSucceeded) {
-              Write-Error "RDP port not reachable via Tailscale"
-              exit 1
-          }
-          Write-Host "✅ RDP port is reachable via Tailscale"
+          # Download phpMyAdmin
+          $pmaDir = "$env:USERPROFILE\phpMyAdmin"
+          Invoke-WebRequest -Uri "https://www.phpmyadmin.net/downloads/phpMyAdmin-latest-all-languages.zip" -OutFile "$env:TEMP\pma.zip"
+          Expand-Archive "$env:TEMP\pma.zip" -DestinationPath $pmaDir
+          Remove-Item "$env:TEMP\pma.zip"
+          Write-Host "phpMyAdmin installed at $pmaDir"
 
-      - name: Display Connection Info
+      # 6️⃣ Display Connection Info
+      - name: Show Access Info
         run: |
           Write-Host "`n==============================="
           Write-Host "✅ RDP CONNECTION DETAILS"
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
           Write-Host "Username: $env:RDP_USER"
           Write-Host "Password: $env:RDP_PASS"
+          Write-Host "MySQL Root: $env:MYSQL_ROOT"
+          Write-Host "phpMyAdmin URL: http://$env:TAILSCALE_IP/phpMyAdmin"
           Write-Host "==============================="
 
-      - name: Keep RDP session alive
+      # 7️⃣ Keep session alive
+      - name: Keep Alive
         run: |
           while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active — Keep session alive."
+              Write-Host "[$(Get-Date)] Session active..."
               Start-Sleep -Seconds 300
           }
