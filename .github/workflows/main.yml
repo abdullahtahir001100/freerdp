@@ -1,39 +1,15 @@
-name: Online RDP + phpMyAdmin via Tailscale
+name: Online phpMyAdmin via Tailscale
 
 on:
   workflow_dispatch:
 
 jobs:
-  rdp-phpmyadmin:
+  phpmyadmin-server:
     runs-on: windows-latest
     timeout-minutes: 3600
 
     steps:
-      # 1️⃣ Enable RDP & Firewall
-      - name: Enable Remote Desktop
-        run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                           -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                           -Name "UserAuthentication" -Value 0 -Force
-          netsh advfirewall firewall delete rule name="RDP-Tailscale" > $null 2>&1
-          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
-          Restart-Service -Name TermService -Force
-
-      # 2️⃣ Create RDP User
-      - name: Create RDP User
-        run: |
-          Add-Type -AssemblyName System.Security
-          $chars = ([char[]](33..126))
-          $password = -join ((1..16) | ForEach-Object { $chars | Get-Random })
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-          echo "RDP_USER=RDP" >> $env:GITHUB_ENV
-          echo "RDP_PASS=$password" >> $env:GITHUB_ENV
-
-      # 3️⃣ Install Tailscale
+      # 1️⃣ Install Tailscale
       - name: Install Tailscale
         run: |
           $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
@@ -42,7 +18,7 @@ jobs:
           Start-Process msiexec.exe -ArgumentList "/i `"$installer`" /quiet /norestart" -Wait
           Remove-Item $installer -Force
 
-      # 4️⃣ Connect Tailscale (6-month auth key)
+      # 2️⃣ Connect Tailscale (6-month auth key)
       - name: Start Tailscale
         env:
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
@@ -66,46 +42,56 @@ jobs:
           if (-not $tsIP) {
               Write-Error "Tailscale IP not assigned"
               & "$env:ProgramFiles\Tailscale\tailscale.exe" status
-              Get-NetIPAddress | Where-Object { $_.AddressFamily -eq 'IPv4' }
               exit 1
           }
 
           Write-Host "Tailscale IP: $tsIP"
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
-      # 5️⃣ Install MySQL + phpMyAdmin
-      - name: Install MySQL & phpMyAdmin
+      # 3️⃣ Install IIS + PHP
+      - name: Install IIS + PHP
         run: |
-          # Install MySQL Server
+          # IIS features
+          Add-WindowsFeature Web-Server, Web-WebServer, Web-Common-Http, Web-Default-Doc, Web-Static-Content, Web-ASP-Net45, Web-ISAPI-Ext, Web-ISAPI-Filter
+          # Install PHP via Chocolatey
+          choco install php --version=8.2 -y
+          Start-Service W3SVC
+
+      # 4️⃣ Install MySQL + phpMyAdmin
+      - name: Install MySQL + phpMyAdmin
+        run: |
+          # Install MySQL
           choco install mysql -y
-          # Secure MySQL root password
           $rootPass = -join ((1..16) | ForEach-Object { ([char[]](33..126)) | Get-Random })
           & "C:\Program Files\MySQL\MySQL Server 8.0\bin\mysqladmin.exe" -u root password $rootPass
           echo "MYSQL_ROOT=$rootPass" >> $env:GITHUB_ENV
 
-          # Download phpMyAdmin
-          $pmaDir = "$env:USERPROFILE\phpMyAdmin"
+          # phpMyAdmin
+          $pmaDir = "C:\inetpub\wwwroot\phpMyAdmin"
+          New-Item -Path $pmaDir -ItemType Directory -Force
           Invoke-WebRequest -Uri "https://www.phpmyadmin.net/downloads/phpMyAdmin-latest-all-languages.zip" -OutFile "$env:TEMP\pma.zip"
           Expand-Archive "$env:TEMP\pma.zip" -DestinationPath $pmaDir
           Remove-Item "$env:TEMP\pma.zip"
           Write-Host "phpMyAdmin installed at $pmaDir"
 
-      # 6️⃣ Display Connection Info
+      # 5️⃣ Open firewall for HTTP
+      - name: Open HTTP port
+        run: |
+          netsh advfirewall firewall add rule name="HTTP-Tailscale" dir=in action=allow protocol=TCP localport=80
+
+      # 6️⃣ Display Access Info
       - name: Show Access Info
         run: |
           Write-Host "`n==============================="
-          Write-Host "✅ RDP CONNECTION DETAILS"
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          Write-Host "Username: $env:RDP_USER"
-          Write-Host "Password: $env:RDP_PASS"
-          Write-Host "MySQL Root: $env:MYSQL_ROOT"
-          Write-Host "phpMyAdmin URL: http://$env:TAILSCALE_IP/phpMyAdmin"
+          Write-Host "✅ Tailscale IP: $env:TAILSCALE_IP"
+          Write-Host "✅ MySQL Root: $env:MYSQL_ROOT"
+          Write-Host "✅ phpMyAdmin URL: http://$env:TAILSCALE_IP/phpMyAdmin"
           Write-Host "==============================="
 
-      # 7️⃣ Keep session alive
+      # 7️⃣ Keep server alive
       - name: Keep Alive
         run: |
           while ($true) {
-              Write-Host "[$(Get-Date)] Session active..."
+              Write-Host "[$(Get-Date)] Server active..."
               Start-Sleep -Seconds 300
           }
