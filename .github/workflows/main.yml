@@ -15,89 +15,80 @@ jobs:
           Add-WindowsFeature Web-Server, Web-WebServer, Web-Common-Http, Web-Default-Doc, Web-Static-Content, Web-ASP, Web-CGI
           Write-Host "✅ IIS installed"
 
-      # 2️⃣ Install PHP
+      # 2️⃣ Install PHP and Configure IIS Handler
       - name: Install PHP
         run: |
           choco install php -y
-          Write-Host "✅ PHP installed"
-
-          # Configure IIS FastCGI Handler for PHP
-          $phpPath = "C:\tools\php\php.exe"
+          $phpCgiPath = "C:\tools\php\php-cgi.exe"
           Import-Module WebAdministration
+          
+          # index.php ko default document set karna (403 error fix)
+          Add-WebConfigurationProperty -pspath 'MACHINE/WEBROOT/APPHOST' -filter "system.webServer/defaultDocument/files" -site "Default Web Site" -name "." -value @{value='index.php'}
+          
           Remove-WebHandler -Name "PHP_via_FastCGI" -ErrorAction SilentlyContinue
-          New-WebHandler -Name "PHP_via_FastCGI" -Path "*.php" -Verb "*" -Modules "FastCgiModule" -ScriptProcessor $phpPath -Force
-          Write-Host "✅ PHP Handler configured in IIS"
+          New-WebHandler -Name "PHP_via_FastCGI" -Path "*.php" -Verb "*" -Modules "FastCgiModule" -ScriptProcessor $phpCgiPath -Force
+          Write-Host "✅ PHP Configured"
 
       # 3️⃣ Install MySQL
       - name: Install MySQL
         run: |
           choco install mysql -y
-          # Generate 16-char alphanumeric root password
+          Start-Sleep -Seconds 10
           $rootPass = -join ((1..16) | ForEach-Object { ([char[]](48..57 + 65..90 + 97..122) | Get-Random) })
-          # Initialize MySQL root password safely
           & "C:\tools\mysql\current\bin\mysql.exe" -u root -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '$rootPass'; FLUSH PRIVILEGES;"
           echo "MYSQL_ROOT=$rootPass" >> $env:GITHUB_ENV
-          Write-Host "✅ MySQL installed, root password set"
+          Write-Host "✅ MySQL Ready"
 
-      # 4️⃣ Download & Configure phpMyAdmin
+      # 4️⃣ Install phpMyAdmin (Fixing Folder Structure)
       - name: Install phpMyAdmin
         run: |
           $pmaDir = "C:\inetpub\wwwroot\phpMyAdmin"
+          New-Item -Path $pmaDir -ItemType Directory -Force
           Invoke-WebRequest -Uri "https://www.phpmyadmin.net/downloads/phpMyAdmin-latest-all-languages.zip" -OutFile "$env:TEMP\pma.zip"
-          Expand-Archive "$env:TEMP\pma.zip" -DestinationPath $pmaDir -Force
-          Remove-Item "$env:TEMP\pma.zip"
-
-          # Fix IIS permissions
+          
+          Expand-Archive "$env:TEMP\pma.zip" -DestinationPath "$env:TEMP\pma_extracted" -Force
+          $internalFolder = Get-ChildItem "$env:TEMP\pma_extracted" | Where-Object { $_.PSIsContainer } | Select-Object -First 1
+          Copy-Item -Path "$($internalFolder.FullName)\*" -Destination $pmaDir -Recurse -Force
+          
           $acl = Get-Acl $pmaDir
           $rule = New-Object System.Security.AccessControl.FileSystemAccessRule("IIS_IUSRS","FullControl","ContainerInherit,ObjectInherit","None","Allow")
           $acl.SetAccessRule($rule)
           Set-Acl $pmaDir $acl
-
-          Write-Host "✅ phpMyAdmin installed at $pmaDir with correct IIS permissions"
+          Write-Host "✅ phpMyAdmin Ready"
 
       # 5️⃣ Install & Connect Tailscale
       - name: Install Tailscale
         run: |
           $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
-          $installer = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest -Uri $url -OutFile $installer
-          Start-Process msiexec.exe -ArgumentList "/i `"$installer`" /quiet /norestart" -Wait
-          Remove-Item $installer -Force
-          Write-Host "✅ Tailscale installed"
+          Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\tailscale.msi"
+          Start-Process msiexec.exe -ArgumentList "/i `"$env:TEMP\tailscale.msi`" /quiet /norestart" -Wait
 
       - name: Connect Tailscale
         env:
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          if (-not $env:TAILSCALE_AUTH_KEY) { Write-Error "TAILSCALE_AUTH_KEY missing"; exit 1 }
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=gh-runner-$env:GITHUB_RUN_ID
-
-          # Wait for Tailscale IP
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=gh-server
           $tsIP = $null
-          for ($i=0; $i -lt 20; $i++) {
+          while (-not $tsIP) {
               $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              if ($tsIP) { break }
-              Write-Host "Waiting for Tailscale IP... ($($i+1)/20)"
-              Start-Sleep -Seconds 5
+              Start-Sleep -Seconds 2
           }
-          if (-not $tsIP) { Write-Error "Tailscale IP not assigned"; exit 1 }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-          Write-Host "✅ Tailscale IP assigned: $tsIP"
 
-      # 6️⃣ Display phpMyAdmin URL & MySQL root password
-      - name: Show Access Info
-        run: |
-          Write-Host "`n==============================="
-          Write-Host "✅ phpMyAdmin ACCESS DETAILS"
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          Write-Host "phpMyAdmin URL: http://$env:TAILSCALE_IP/phpMyAdmin"
-          Write-Host "MySQL Root Password: $env:MYSQL_ROOT"
-          Write-Host "==============================="
-
-      # 7️⃣ Keep Runner Alive
-      - name: Keep session alive
+      # 6️⃣ Persistent Monitor Loop (Credentials hamesha screen pe rahengi)
+      - name: Keep Alive and Show Credentials
         run: |
           while ($true) {
-              Write-Host "[$(Get-Date)] Server active..."
+              Clear-Host
+              Write-Host "`n===============================================" -ForegroundColor Cyan
+              Write-Host "🚀 SERVER IS ACTIVE" -ForegroundColor Green
+              Write-Host "-----------------------------------------------"
+              Write-Host "🔗 phpMyAdmin: http://$env:TAILSCALE_IP/phpMyAdmin/" -ForegroundColor Yellow
+              Write-Host "👤 User:       root"
+              Write-Host "🔑 Password:   $env:MYSQL_ROOT" -ForegroundColor Red
+              Write-Host "-----------------------------------------------"
+              Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+              Write-Host "Last Update:  $(Get-Date)"
+              Write-Host "==============================================="
               Start-Sleep -Seconds 300
           }
