@@ -25,8 +25,10 @@ jobs:
       - name: Install MySQL
         run: |
           choco install mysql -y
-          $rootPass = -join ((1..16) | ForEach-Object { ([char[]](33..126)) | Get-Random })
-          & "C:\Program Files\MySQL\MySQL Server 8.0\bin\mysqladmin.exe" -u root password $rootPass
+          # Generate 16-char alphanumeric root password (safe for CLI)
+          $rootPass = -join ((1..16) | ForEach-Object { ([char[]](48..57 + 65..90 + 97..122) | Get-Random) })
+          # Initialize MySQL root password safely
+          & "C:\Program Files\MySQL\MySQL Server 8.0\bin\mysql.exe" -u root -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '$rootPass'; FLUSH PRIVILEGES;"
           echo "MYSQL_ROOT=$rootPass" >> $env:GITHUB_ENV
           Write-Host "✅ MySQL installed, root password set"
 
@@ -67,7 +69,7 @@ jobs:
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
           Write-Host "✅ Tailscale IP assigned: $tsIP"
 
-      # 6️⃣ Display phpMyAdmin URL
+      # 6️⃣ Display phpMyAdmin URL & MySQL root password
       - name: Show Access Info
         run: |
           Write-Host "`n==============================="
